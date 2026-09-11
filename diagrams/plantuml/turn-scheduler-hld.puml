@@ -1,0 +1,285 @@
+' =============================================================
+' TurnScheduler 概要设计（HLD）PlantUML 图集
+' 渲染方式（任选）：
+'   1) 安装 PlantUML (https://plantuml.com/download) 后:
+'      java -jar plantuml.jar turn-scheduler-hld.puml
+'   2) 在线: https://www.plantuml.com/plantuml/uml/SyfFKj2rKt3CoKnELR1Io4ZDoSa70000
+' =============================================================
+
+' -------------------------------------------------------------
+' 2. 功能需求流程（HLD 2.1）
+' -------------------------------------------------------------
+@startuml hld-20-function-flow
+title HLD 2.1 功能需求流程
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+actor "用户" as U
+actor "运维" as O
+start
+:用户提交问题;
+:会话管理写 turn_ready_outbox\n（OUTBOX，与 Turn 同事务）;
+:TurnScheduler claim 消费 Outbox\n（PENDING→CLAIMED，30s 租约）;
+:Inbox 幂等去重准入\n（turn_admission ON CONFLICT）;
+if (重复消息?) then (是)
+  :ack 置 DONE，跳过;
+  stop
+else (否)
+endif
+:ack 置 DONE;
+:写 turn_admission (WAITING)\nINBOX+queue 合一：落账即入队;
+:SKIP LOCKED 串行激活（同 Session 单活）;
+:冻结 ContextSnapshot / InvocationSpec;
+:创建 RuntimeInvocation + lease_info 双层租约;
+:选择健康 Runtime 下拨（fencing token）;
+repeat
+  :接收 Runtime SSE 事件;
+  if (确认内容?) then (是)
+    :幂等写 committed_content;
+    :Redis Stream 推送 Delta（体验层）;
+  else (否)
+  endif
+repeat while (终态事件?) is (否) not
+:完成判定（COMPLETED / INTERRUPTED）;
+:Session 推进，释放租约;
+:Gateway 推送结果给用户;
+stop
+@enduml
+
+' -------------------------------------------------------------
+' 4.2 总体架构（HLD 4.2）
+' -------------------------------------------------------------
+@startuml hld-42-architecture
+title HLD 4.2 总体架构
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam componentStyle rectangle
+
+[前端 UI] as UI
+package "Kubernetes 集群" as K8S {
+  component "会话管理 Gateway（多 Pod）" as GW
+  component "TurnScheduler（多 Pod）" as TS
+  component "Agent Runtime（多 Pod）" as RT
+}
+database "PostgreSQL\n权威状态" as PG
+database "Redis\nDelta 事件流" as RD
+cloud "Nacos\n注册发现" as NC
+
+UI --> GW : 提交 / 订阅 SSE
+GW --> PG : Outbox / 终态
+TS --> PG : 租约 / SKIP LOCKED / 确认
+TS --> RD : Delta 写入 (Redis Stream)
+TS --> NC : 注册 / 发现 / 健康
+RT --> NC : 注册
+RT --> TS : SSE 事件流
+RD --> GW : 事件消费推送
+GW --> UI : SSE 推送
+@enduml
+
+' -------------------------------------------------------------
+' 4.3 核心对象模型（HLD 4.3）
+' -------------------------------------------------------------
+@startuml hld-43-object-model
+title HLD 4.3 核心对象层级
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam componentStyle rectangle
+
+component "Session（会话）" as SESS
+component "Turn（一轮问答）" as TURN
+component "Attempt 1（执行尝试）" as ATT1
+component "Attempt 2（重试）" as ATT2
+component "RuntimeInvocation（调度单元）" as INV1
+component "RuntimeInvocation（调度单元）" as INV2
+component "Runtime Execution\n（Worker 并发槽）" as EXEC1
+component "Runtime Execution\n（Worker 并发槽）" as EXEC2
+
+SESS --> TURN : 包含
+TURN --> ATT1 : 首次执行
+TURN --> ATT2 : 用户重试
+ATT1 --> INV1 : 一一对应
+ATT2 --> INV2 : 一一对应
+INV1 --> EXEC1 : 1:1 或 1:N（动态并行）
+INV2 --> EXEC2 : 1:1 或 1:N（动态并行）
+
+note right of EXEC2
+  对前端屏蔽 Attempt：
+  实时流只推活跃 Attempt，
+  Turn 是唯一可见对象
+end note
+@enduml
+
+' -------------------------------------------------------------
+' 4.4 模块划分与职责（HLD 4.4）
+' -------------------------------------------------------------
+@startuml hld-44-modules
+title HLD 4.4 模块划分与职责
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam componentStyle rectangle
+
+package "接入层" {
+  component "TurnAdmissionListener\nOutbox 消费" as M0
+}
+package "调度核心层" {
+  component "AdmissionService\n幂等准入" as M1
+  component "QueueActivationService\n排队 / 激活" as M2
+  component "ContextFreezeService\nSnapshot/Spec 冻结" as M3
+  component "InvocationService\n创建 / 租约" as M4
+  component "RuntimeDispatcher\nRuntime 选型 / 下拨" as M5
+  component "CommitService\n确认内容累积" as M6
+  component "CompletionService\n终态推进" as M7
+}
+package "高可用层" {
+  component "LeaseHeartbeatService\n心跳" as M8
+  component "RecoveryService\n接管 / 中断" as M9
+  component "SSEPushService\n事件推送" as M10
+}
+package "基础设施层" {
+  component "ShardRouter\n分片路由 N=1" as M11
+  component "IdempotencyStore\n幂等" as M12
+  component "Metrics / Alert\n可观测性" as M13
+}
+
+M0 --> M1
+M1 --> M2
+M2 --> M3
+M3 --> M4
+M4 --> M5
+M5 --> M6
+M6 --> M7
+M8 ..> M4 : 心跳刷新
+M9 ..> M4 : 接管
+M10 ..> M6 : Delta
+M11 ..> M4 : 路由
+M12 ..> M1 : 去重
+@enduml
+
+' -------------------------------------------------------------
+' 4.5 整体调度主流程 Level 0（HLD 4.5）
+' -------------------------------------------------------------
+@startuml hld-45-level0
+title HLD 4.5 整体调度主流程（Level 0）
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+start
+:会话管理提交 Turn\n写 turn_ready_outbox（同事务）;
+:TurnScheduler claim 消费 Outbox\n（PENDING→CLAIMED，30s 租约）;
+:Inbox 去重（幂等键）;
+if (同 Session 是否空闲?) then (忙)
+  :等待 Lease 释放;
+else (空闲)
+endif
+:写入 turn_admission (WAITING)\nack 置 DONE\nINBOX+queue 合一：落账即入队;
+:SKIP LOCKED 激活 (ACTIVATED);
+:冻结 ContextSnapshot / InvocationSpec;
+:创建 runtime_invocation\n获取 lease_info 双层租约;
+:选择健康 Runtime;
+:下拨执行 (INVOCATION_DISPATCHED);
+repeat
+  :Runtime 持续回报事件;
+  if (确认内容?) then (是)
+    :幂等写 committed_content\nRedis Stream 推送 Delta;
+  else (否)
+  endif
+repeat while (终态事件?) is (否) not
+:完成判定 (COMPLETED / INTERRUPTED);
+:Session 推进，释放 Lease;
+stop
+@enduml
+
+' -------------------------------------------------------------
+' 6.1 数据实体关系（HLD 6.1 ER 图）
+' -------------------------------------------------------------
+@startuml hld-61-er
+title HLD 6.1 Gateway 侧数据实体关系
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+hide circle
+skinparam classAttributeIconSize 0
+
+class "turn_admission" as ADM {
+  + id : bigserial PK
+  + session_id : uuid
+  + turn_id : uuid
+  + attempt_seq : int
+  + priority : int
+  + status : varchar
+  // INBOX + queue 合一：落账即入队
+}
+class "runtime_invocation" as INV {
+  + id : bigserial PK
+  + session_id : uuid
+  + turn_id / attempt_id
+  + status : varchar
+  + fencing_token
+  + runtime_status : varchar
+  + event_sequence : bigint
+}
+class "invocation_spec" as SPEC {
+  + invocation_id : PK FK
+  + context_snapshot : jsonb
+  + spec : jsonb
+}
+class "lease_info" as LEASE {
+  + lease_type : varchar
+  + session_id / invocation_id
+  + controller_epoch
+  + holder_pod
+  + lease_until
+}
+class "committed_content" as CONTENT {
+  + id : bigserial PK
+  + invocation_id : FK
+  + seq : bigint
+  + payload : text
+}
+
+ADM "1" -- "0..*" INV : 执行产生
+ADM "1" -- "0..*" CONTENT : 确认累积
+INV "1" -- "1" SPEC : 冻结
+INV "1" -- "2" LEASE : 串行执行权 + 控制权
+INV "1" -- "0..*" CONTENT : 内容确认
+@enduml
+
+' -------------------------------------------------------------
+' 10.1 K8s 部署拓扑（HLD 10.1）
+' -------------------------------------------------------------
+@startuml hld-101-deployment
+title HLD 10.1 K8s 部署拓扑
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+node "Kubernetes 集群" as K8S {
+  node "Deployment: 会话管理 Gateway" as DGW {
+    component "Gateway Pod" as GW1
+    component "Gateway Pod" as GW2
+  }
+  node "Deployment: TurnScheduler" as DTS {
+    component "Scheduler Pod" as TS1
+    component "Scheduler Pod" as TS2
+    component "Scheduler Pod (扩展)" as TS3
+  }
+  node "Deployment: Agent Runtime" as DRT {
+    component "Runtime Pod" as RT1
+    component "Runtime Pod" as RT2
+    component "Runtime Pod (扩展·规模大头)" as RT3
+  }
+}
+
+node "有状态服务" as STS {
+  database "PostgreSQL\n(StatefulSet)" as PG
+  database "Redis\n(StatefulSet/哨兵)" as RD
+  node "Nacos 集群" as NC
+}
+
+TS1 --> PG : DB 竞争 / 租约
+TS2 --> PG
+TS3 --> PG
+TS1 --> RD : Redis Stream
+TS1 --> NC : 注册 / 发现
+RT1 --> NC : 注册
+RT1 --> TS1 : SSE 事件流
+GW1 --> TS1 : 订阅 / 推送
+GW2 --> TS1
+@enduml

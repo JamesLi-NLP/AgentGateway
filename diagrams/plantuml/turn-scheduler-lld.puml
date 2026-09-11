@@ -1,0 +1,296 @@
+' =============================================================
+' TurnScheduler 详细设计（LLD）PlantUML 图集
+' 渲染：java -jar plantuml.jar turn-scheduler-lld.puml
+' =============================================================
+
+' -------------------------------------------------------------
+' 4.1 提交与准入时序
+' -------------------------------------------------------------
+@startuml lld-41-admission
+title LLD 4.1 提交与准入时序
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+participant "会话管理" as SM
+database "会话管理库" as SMPG
+participant "TurnScheduler" as TS
+database "Gateway库" as TSPG
+
+SM -> SMPG : [事务] 写 Turn + 写 turn_ready_outbox
+TS -> SMPG : claim(batchSize, podId)\nPENDING→CLAIMED（SKIP LOCKED + 30s 租约）
+SMPG --> TS : TurnReadyMessage[]（outbox_id 等）
+loop 每条消息
+    TS -> TSPG : INSERT turn_admission (status=WAITING)\nON CONFLICT DO NOTHING\n幂等键 (session_id, turn_id, attempt_id)\nINBOX+queue 合一：落账即入队
+    alt 新 Attempt
+        TS -> TSPG : 已入队，凭 admission 行参与竞争
+    else 重复消息
+        TS -> TSPG : 静默跳过（Inbox 幂等）
+    end
+    TS -> SMPG : ack(outbox_id, podId)\nCLAIMED→DONE（先落账后 ack）
+end
+note right of TS : claim 后崩溃 → 租约30s过期\n回 PENDING → 其他 Pod 重领
+@enduml
+
+' -------------------------------------------------------------
+' 4.2 调度与执行时序
+' -------------------------------------------------------------
+@startuml lld-42-dispatch
+title LLD 4.2 调度与执行时序
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+participant "TurnScheduler" as TS
+database "PostgreSQL" as PG
+participant "Agent Runtime" as RT
+
+TS -> PG : UPDATE turn_admission SKIP LOCKED 激活\n（WAITING→ACTIVATING，单表竞争）
+TS -> PG : 冻结 ContextSnapshot + InvocationSpec
+TS -> PG : [事务] 创建 runtime_invocation\n+ lease_info（session + controller）
+TS -> PG : 置 status=DISPATCHED, runtime_replica_id
+TS -> RT : 下拨 SchedulingContext(fencing_token, spec)
+RT --> TS : SSE: assistant_output_delta
+TS -> PG : 幂等写 committed_content（seq 去重）
+TS -> TS : XADD Redis Stream（Delta 体验层）
+RT --> TS : SSE: invocation_completed
+TS -> PG : 终态判定 COMPLETED + 释放双层租约
+@enduml
+
+' -------------------------------------------------------------
+' 4.3 故障接管时序（Pod 崩溃）
+' -------------------------------------------------------------
+@startuml lld-43-takeover
+title LLD 4.3 故障接管时序（Pod 崩溃）
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+participant "旧 Pod\n(Controller)" as OA
+database "PostgreSQL" as PG
+participant "新 Pod\n(Controller)" as NB
+participant "Agent Runtime" as RT
+
+OA -> PG : 心跳续约（30s / 60s）...
+OA -->X PG : 宕机，停止心跳
+PG --> NB : 检测 lease_info(controller) 过期
+NB -> PG : controller_epoch = 旧epoch + 1 重获控制权
+NB -> PG : 生成新 fencing_token
+NB -> RT : 重新下拨（新 fencing_token）
+RT --> NB : 旧请求 fencing 过期被拒，接受新请求
+NB -> PG : 从 committed_seq 水位继续累积
+@enduml
+
+' -------------------------------------------------------------
+' 4.4 流式推送时序（Attempt 屏蔽）
+' -------------------------------------------------------------
+@startuml lld-44-stream
+title LLD 4.4 流式推送时序（Attempt 屏蔽）
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+participant "Agent Runtime" as RT
+participant "TurnScheduler" as TS
+database "Redis Stream" as RD
+participant "Gateway(SSE)" as GW
+participant "前端" as UI
+
+RT --> TS : SSE: delta(attempt=2, seq=41)
+TS -> RD : XADD turn_events:s7 {attempt_id:2, seq:41}
+TS -> GW : 推送（仅 attempt_id == 活跃 attempt）
+GW -> UI : SSE: {turn_id, seq, type, payload}
+note over TS,GW : 用户 retryTurn 后 Attempt 切换
+TS -> GW : SSE: stream_reset {from_sequence: 50}
+GW -> UI : 清空渲染缓冲，接收新回答
+@enduml
+
+' -------------------------------------------------------------
+' 5.1 Turn 状态机
+' -------------------------------------------------------------
+@startuml lld-51-state-turn
+title LLD 5.1 Turn 状态机（会话管理侧）
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+[*] --> WAITING : 提交
+WAITING --> RUNNING : 首个 Attempt 开始
+RUNNING --> COMPLETED : 正式回答完成
+RUNNING --> INTERRUPTED : 中断可重试
+INTERRUPTED --> RUNNING : 用户重试（新 Attempt）
+COMPLETED --> [*]
+INTERRUPTED --> [*]
+@enduml
+
+' -------------------------------------------------------------
+' 5.2 Attempt 状态机
+' -------------------------------------------------------------
+@startuml lld-52-state-attempt
+title LLD 5.2 Attempt 状态机（会话管理侧）
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+[*] --> CREATED
+CREATED --> EXECUTING
+EXECUTING --> COMPLETED
+EXECUTING --> INTERRUPTED
+COMPLETED --> [*]
+INTERRUPTED --> [*]
+@enduml
+
+' -------------------------------------------------------------
+' 5.3 RuntimeInvocation 状态机
+' -------------------------------------------------------------
+@startuml lld-53-state-invocation
+title LLD 5.3 RuntimeInvocation 状态机（调度侧）
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+
+[*] --> ADMITTED : 准入
+ADMITTED --> FREEZING : 开始冻结
+FREEZING --> FROZEN : 冻结完成
+FREEZING --> TERMINATED : 冻结失败
+FROZEN --> ACTIVATING : 排队激活
+ACTIVATING --> ACTIVATED : 激活成功
+ACTIVATED --> DISPATCHED : 下拨 Runtime
+DISPATCHED --> EXECUTING : Runtime 开始执行
+EXECUTING --> PAUSED : 条件等待
+PAUSED --> EXECUTING : 条件满足
+EXECUTING --> COMPLETED : 完成事件
+EXECUTING --> INTERRUPTED : 失败 / 失联
+PAUSED --> INTERRUPTED : 接管 / 超时
+TERMINATED --> [*]
+COMPLETED --> [*]
+INTERRUPTED --> [*]
+@enduml
+
+' -------------------------------------------------------------
+' 7.1 领域模型类图
+' -------------------------------------------------------------
+@startuml lld-71-class-domain
+title LLD 7.1 领域模型类图
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam classAttributeIconSize 0
+
+class Turn {
+  + UUID id
+  + UUID sessionId
+  + TurnStatus status
+  + List<Attempt> attempts
+}
+class Attempt {
+  + UUID id
+  + int seq
+  + AttemptStatus status
+}
+class RuntimeInvocation {
+  + long id
+  + UUID sessionId
+  + UUID turnId
+  + UUID attemptId
+  + InvocationStatus status
+  + long committedSeq
+  + long initSeq
+  + long fencingToken
+}
+class InvocationSpec {
+  + long invocationId
+  + JsonNode contextSnapshot
+  + JsonNode spec
+}
+class LeaseInfo {
+  + LeaseType leaseType
+  + UUID sessionId
+  + long invocationId
+  + long controllerEpoch
+  + String holderPod
+  + Instant leaseUntil
+}
+class CommittedContent {
+  + long id
+  + UUID turnId
+  + long seq
+  + String content
+}
+
+Turn "1" *-- "0..*" Attempt
+Attempt "1" --> "1" RuntimeInvocation
+RuntimeInvocation "1" --> "1" InvocationSpec
+RuntimeInvocation "1" --> "2" LeaseInfo
+RuntimeInvocation "1" --> "0..*" CommittedContent
+@enduml
+
+' -------------------------------------------------------------
+' 7.2 服务层类图
+' -------------------------------------------------------------
+@startuml lld-72-class-service
+title LLD 7.2 服务层类图
+skinparam backgroundColor white
+skinparam defaultFontName "Microsoft YaHei"
+skinparam classAttributeIconSize 0
+
+class SchedulingLoop {
+  - TurnAdmissionService admission
+  - TurnQueueActivationService activation
+  - TurnExecutionService execution
+  - LeaseHeartbeatService heartbeat
+  + runLoop() : void
+}
+class TurnAdmissionService {
+  + admit(TurnReadyMessage) : AdmissionResult
+}
+class OutboxConsumer {
+  + claim(int batchSize) : List<TurnReadyMessage>
+  + ack(long outboxId) : void
+}
+class TurnQueueActivationService {
+  + pollAndActivate() : int
+}
+class TurnContextFreezeService {
+  + freeze(Admission) : InvocationSpec
+}
+class TurnExecutionService {
+  + createInvocationWithLeases() : long
+}
+class RuntimeDispatchService {
+  + dispatch(Invocation, RuntimeInstance) : void
+}
+class RuntimeEventRouter {
+  + onDelta(DeltaEvent) : void
+  + onCommitted(CommittedEvent) : void
+  + onCompleted(CompletionEvent) : void
+}
+class TurnConfirmService {
+  + confirmCommitted(CommittedEvent) : void
+}
+class TurnCompletionService {
+  + complete(Invocation) : void
+}
+class LeaseHeartbeatService {
+  + refreshAll() : void
+}
+class TurnRecoveryService {
+  + recoverExpiredLeases() : void
+  + detectStalled() : void
+}
+class TurnStreamPushService {
+  + pushDeltaToStream(DeltaEvent) : void
+  + pushToClient(StreamEvent) : void
+}
+class RuntimeInstanceRegistry {
+  + healthyRuntimes() : List<RuntimeInstance>
+}
+class ShardRouter {
+  + resolveShard(UUID sessionId) : DataSource
+}
+
+SchedulingLoop --> TurnAdmissionService
+TurnAdmissionService --> OutboxConsumer
+SchedulingLoop --> TurnQueueActivationService
+SchedulingLoop --> TurnExecutionService
+SchedulingLoop --> LeaseHeartbeatService
+TurnExecutionService --> RuntimeDispatchService
+RuntimeDispatchService --> RuntimeInstanceRegistry
+RuntimeEventRouter --> TurnConfirmService
+RuntimeEventRouter --> TurnCompletionService
+TurnConfirmService --> TurnStreamPushService
+TurnRecoveryService --> TurnExecutionService
+TurnExecutionService --> ShardRouter
+@enduml
