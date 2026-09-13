@@ -318,7 +318,7 @@ delete from lease_info where lease_type = 'controller' and invocation_id = :id;
 
 ```text
 扫描 executing 但 runtime_invocation.updated_at 停滞（观测字段不再推进）+ Runtime 心跳超时
-  -> 按 commit 分界（12.2）：
+  -> 按 commit 分界（10.2）：
      未 commit -> 同一 Attempt 内自动重派（2.6）/ 无可用 Runtime 置 PAUSED 挂起
      已 commit -> Attempt 判 FAILED（fail_reason 溯源），Turn 自动 INFRA_RETRY 新 Attempt
   -> 不拼接：新 Attempt 新租约新 Watermark
@@ -393,7 +393,7 @@ TTL: EXPIRE turn_events:<session_id> 600
 持有 SSE 连接者，按 client_watermark 消费:
   XRANGE turn_events:<session_id> <watermark+1> +
 过滤: attempt_id == 当前活跃 attempt 才推送
-控制事件: attempt 切换时推 stream_reset（见 11.3 契约）
+控制事件: attempt 切换时推 stream_reset（见 12.1 契约）
 断连重连（决策 5）: SSE 传输层断连 ≠ 死亡；客户端自动重连（1s→30s 指数退避 + jitter，
   4min 窗口）后按 event_seq 续读；4min < 判据 2 的 5min 阈值，重连窗口落在官方恢复时序内
 ```
@@ -643,7 +643,7 @@ sequenceDiagram
 
 ## 5. 状态机详细设计
 
-### 5.1 Turn 状态（会话管理侧，对齐 design.md 5.1 / D5 / D28）
+### 5.1 Turn 状态（会话管理侧，对齐 design.md 5.2 / D5 / D28）
 
 ```mermaid
 stateDiagram-v2

@@ -479,7 +479,7 @@ erDiagram
 |---|---|---|
 | 基础设施故障 | Gateway Pod 宕机 | L0 主动释放 / L1 Nacos+节点证据提前接管 / L2 租约过期兜底 |
 | 调度侧故障 | TurnScheduler Pod 崩溃 | 心跳停更 → 其他 Pod 接管（controller_epoch 递增） |
-| 执行侧故障 | Runtime 失联/崩溃 | 自动重派 ≤5 次（退避 1s→2s→4s→8s→16s）；耗尽且无可用 Runtime → invocation `paused` 挂起巡检唤醒（12.2.1）；INFRA_RETRY 超限 → Turn `FAILED`（fail_reason='RETRY_EXCEEDED'，等用户 USER_RETRY，D28），已确认内容保留 |
+| 执行侧故障 | Runtime 失联/崩溃 | 自动重派 ≤5 次（退避 1s→2s→4s→8s→16s）；耗尽且无可用 Runtime → invocation `paused` 挂起巡检唤醒（11.3）；INFRA_RETRY 超限 → Turn `FAILED`（fail_reason='RETRY_EXCEEDED'，等用户 USER_RETRY，D28），已确认内容保留 |
 | 调度侧故障 | activating 卡死（协调者死于激活中途） | 10s 巡检 + 60s 阈值回收回 QUEUED（SKIP LOCKED + CAS，session 租约兜底） |
 | 协调者疑似死亡 | Nacos 心跳超时 | 两段式判死：`/internal/health` 确证（2s 超时 / 30s 节流）；判死≠接管，接管经 PG 租约 + epoch 递增 + 新 fencing token |
 | 数据竞争 | 双 Pod 同时激活/接管 | SKIP LOCKED 保证唯一性，败者重试 |
