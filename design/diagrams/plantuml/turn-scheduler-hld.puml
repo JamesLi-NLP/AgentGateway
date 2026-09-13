@@ -17,16 +17,14 @@ actor "用户" as U
 actor "运维" as O
 start
 :用户提交问题;
-:会话管理写 turn_ready_outbox\n（OUTBOX，与 Turn 同事务）;
-:TurnScheduler claim 消费 Outbox\n（PENDING→CLAIMED，30s 租约）;
-:Inbox 幂等去重准入\n（turn_admission ON CONFLICT）;
-if (重复消息?) then (是)
-  :ack 置 DONE，跳过;
+:Gateway 同步调会话管理 submit\n拿回执（A1 外部契约）;
+:回执幂等落账 turn_admission\nINBOX+queue 合一：落账即入队;
+if (重复回执?) then (是)
+  :ON CONFLICT 静默跳过;
   stop
 else (否)
 endif
-:ack 置 DONE;
-:写 turn_admission (WAITING)\nINBOX+queue 合一：落账即入队;
+:写 turn_admission (WAITING)\n（原 turn_ready_outbox 消费已废弃，D1/D15）;
 :SKIP LOCKED 串行激活（同 Session 单活）;
 :冻结 ContextSnapshot / InvocationSpec;
 :创建 RuntimeInvocation + lease_info 双层租约;
@@ -39,7 +37,7 @@ repeat
   else (否)
   endif
 repeat while (终态事件?) is (否) not
-:完成判定（COMPLETED / INTERRUPTED）;
+:完成判定（COMPLETED / FAILED / CANCELLED，D28）;
 :Session 推进，释放租约;
 :Gateway 推送结果给用户;
 stop
@@ -62,13 +60,13 @@ package "Kubernetes 集群" as K8S {
 }
 database "PostgreSQL\n权威状态" as PG
 database "Redis\nDelta 事件流" as RD
-cloud "Nacos\n注册发现" as NC
+cloud "Nacos\n注册发现 / 观测" as NC
 
 UI --> GW : 提交 / 订阅 SSE
-GW --> PG : Outbox / 终态
+GW --> PG : 同步回执落账 / 终态
 TS --> PG : 租约 / SKIP LOCKED / 确认
 TS --> RD : Delta 写入 (Redis Stream)
-TS --> NC : 注册 / 发现 / 健康
+TS --> NC : 注册 / 发现 / 健康 / 观测上报
 RT --> NC : 注册
 RT --> TS : SSE 事件流
 RD --> GW : 事件消费推送
@@ -118,7 +116,7 @@ skinparam defaultFontName "Microsoft YaHei"
 skinparam componentStyle rectangle
 
 package "接入层" {
-  component "TurnAdmissionListener\nOutbox 消费" as M0
+  component "TurnAdmission\n同步回执落账" as M0
 }
 package "调度核心层" {
   component "AdmissionService\n幂等准入" as M1
@@ -131,7 +129,9 @@ package "调度核心层" {
 }
 package "高可用层" {
   component "LeaseHeartbeatService\n心跳" as M8
-  component "RecoveryService\n接管 / 中断" as M9
+  component "RecoveryService\n接管 / 中断 / 巡检" as M9
+  component "PodHealthProbe\n两段式判死" as M14
+  component "InflightRegistry\n容量 / 观测上报" as M15
   component "SSEPushService\n事件推送" as M10
 }
 package "基础设施层" {
@@ -149,6 +149,8 @@ M5 --> M6
 M6 --> M7
 M8 ..> M4 : 心跳刷新
 M9 ..> M4 : 接管
+M14 ..> M9 : 判死线索（观测）
+M15 ..> M4 : 容量 / 续期锚定
 M10 ..> M6 : Delta
 M11 ..> M4 : 路由
 M12 ..> M1 : 去重
@@ -163,19 +165,20 @@ skinparam backgroundColor white
 skinparam defaultFontName "Microsoft YaHei"
 
 start
-:会话管理提交 Turn\n写 turn_ready_outbox（同事务）;
-:TurnScheduler claim 消费 Outbox\n（PENDING→CLAIMED，30s 租约）;
-:Inbox 去重（幂等键）;
+:Gateway 同步调会话管理 submit\n拿回执（A1 外部契约）;
+:回执幂等落账 turn_admission\nINBOX+queue 合一：落账即入队;
+:幂等去重（决策 D15）;
 if (同 Session 是否空闲?) then (忙)
   :等待 Lease 释放;
 else (空闲)
 endif
-:写入 turn_admission (WAITING)\nack 置 DONE\nINBOX+queue 合一：落账即入队;
+:写 turn_admission (WAITING)\n（原 turn_ready_outbox 已废弃）;
 :SKIP LOCKED 激活 (ACTIVATED);
 :冻结 ContextSnapshot / InvocationSpec;
 :创建 runtime_invocation\n获取 lease_info 双层租约;
+:容量门控（InflightRegistry\nrunning_count < max_running）;
 :选择健康 Runtime;
-:下拨执行 (INVOCATION_DISPATCHED);
+:下拨执行 (INVOCATION_DISPATCHED)\n失败自动重派 ≤5 次（退避 1s→16s）;
 repeat
   :Runtime 持续回报事件;
   if (确认内容?) then (是)
@@ -183,7 +186,7 @@ repeat
   else (否)
   endif
 repeat while (终态事件?) is (否) not
-:完成判定 (COMPLETED / INTERRUPTED);
+:完成判定 (COMPLETED / FAILED / CANCELLED，D28);
 :Session 推进，释放 Lease;
 stop
 @enduml
@@ -205,7 +208,9 @@ class "turn_admission" as ADM {
   + attempt_seq : int
   + priority : int
   + status : varchar
+  + fail_reason : varchar
   // INBOX + queue 合一：落账即入队
+  // 终态：COMPLETED / FAILED / DEAD / CANCELLED（fail_reason 溯源）
 }
 class "runtime_invocation" as INV {
   + id : bigserial PK
@@ -277,7 +282,7 @@ TS1 --> PG : DB 竞争 / 租约
 TS2 --> PG
 TS3 --> PG
 TS1 --> RD : Redis Stream
-TS1 --> NC : 注册 / 发现
+TS1 --> NC : 注册 / 发现 / 观测上报
 RT1 --> NC : 注册
 RT1 --> TS1 : SSE 事件流
 GW1 --> TS1 : 订阅 / 推送

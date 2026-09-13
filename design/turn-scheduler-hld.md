@@ -41,7 +41,6 @@ TurnScheduler 是平台从"单机内嵌调度"走向"K8s 多 Pod 分布式调度
 | Fencing Token | 防呆令牌，拒绝陈旧控制者的写入 |
 | SKIP LOCKED | PostgreSQL 行级跳过锁机制，用于分布式竞争 |
 | SSE | Server-Sent Events，服务端推送事件流 |
-| Outbox | 发件箱模式，Gateway 侧事务消息持久化 |
 | Inbox | 收件箱模式，调度侧消费幂等去重 |
 
 ### 1.4 参考资料
@@ -78,7 +77,7 @@ flowchart LR
     end
 
     U --提交问题--> G
-    G --写入 Outbox--> A
+    G --同步回执落账--> A
     R --执行结果/事件流--> E
     E --结果确认--> F
     F --交付终态--> G
@@ -90,7 +89,7 @@ flowchart LR
 
 | 编号 | 功能 | 说明 |
 |---|---|---|
-| F1 | Turn 准入 | claim 消费会话管理 Outbox（turn_ready_outbox），Inbox 幂等接收 Turn 提交 |
+| F1 | Turn 准入 | 同步提交通道（决策 D1/D15）：Gateway 同步调会话管理 submit 拿回执，回执幂等落账 turn_admission（INBOX+queue 合一），不再消费跨库 Outbox |
 | F2 | 排队与激活 | 同 Session 串行，跨 Session 并行，分布式竞争安全 |
 | F3 | 调度执行 | 选择健康 Runtime，按 Worker 容量分派执行 |
 | F4 | 结果确认 | 幂等累积确认内容（Committed Content） |
@@ -134,7 +133,7 @@ flowchart LR
 |---|---|---|---|
 | PostgreSQL | 权威状态 + 分布式互斥 | SKIP LOCKED 竞争、Lease、Committed Content | 故障恢复真相唯一来源 |
 | Redis | 短时态 + 实时体验 | Redis Stream 承载 Delta 事件流（TTL） | 体验层，可丢不丢内容 |
-| Nacos | 注册发现 + 健康感知 + 配置 | Runtime/Gateway 注册与发现、配置下发 | 缩短故障发现时间，不替代租约 |
+| Nacos | 注册发现 + 健康感知 + 配置 + **观测上报（纯观测）** | Runtime/Gateway 注册与发现、配置下发；Gateway Pod 上报本 Pod InflightRegistry 快照（容量观测，详见 v2 §14.5） | 缩短故障发现时间，不替代租约；**上报值调度决策永不引用**，数据取自 Pod 内存不查库 |
 | Kubernetes | 部署编排 + 探针 | Deployment HPA、liveness/readiness、滚动更新 | 只决定流量分配，不参与所有权判定 |
 
 ---
@@ -185,10 +184,10 @@ flowchart TB
     end
 
     UI --提交/订阅--> GWP
-    GWP --Outbox 持久化--> PG
+    GWP --同步回执落账--> PG
     TS1 --主张/心跳/确认--> PG
     TS1 --Delta 写入--> RD
-    TS1 --注册/发现/健康--> NC
+    TS1 --注册/发现/健康/观测上报--> NC
     RT1 --注册--> NC
     RT1 --SSE 事件流--> TS1
     RD --推送事件--> GWP
@@ -198,7 +197,7 @@ flowchart TB
 **架构要点：**
 
 - TurnScheduler 与 Gateway 同为 Spring Boot 服务，**共享同一 PG 的不同 Schema 域**（会话管理侧 / 调度侧分库或分 Schema）；
-- Gateway 通过 Outbox 持久化 Turn 提交，TurnScheduler 通过 Inbox 幂等消费；
+- Gateway 同步调会话管理 submit 拿回执（A1 外部契约），回执幂等落账 turn_admission 完成准入（决策 D1/D15，替代原 Outbox/Inbox 异步消费）；
 - TurnScheduler 与 Runtime 之间是调度关系：下拨即委托，以租约收拢执行权；
 - 用户订阅的 SSE 由 Gateway 提供，事件源来自 Redis Stream（由 TurnScheduler 写入）。
 
@@ -227,7 +226,7 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph API[接入层]
-        M0[TurnAdmissionListener<br/>Outbox 消费]
+        M0[TurnAdmission<br/>同步回执落账]
     end
     subgraph Core[调度核心层]
         M1[AdmissionService<br/>幂等准入]
@@ -240,7 +239,9 @@ flowchart TB
     end
     subgraph HA[高可用层]
         M8[LeaseHeartbeatService<br/>心跳]
-        M9[RecoveryService<br/>接管/中断]
+        M9[RecoveryService<br/>接管/中断/巡检]
+        M14[PodHealthProbe<br/>两段式判死]
+        M15[InflightRegistry<br/>容量/观测上报]
         M10[SSEPushService<br/>事件推送]
     end
     subgraph Infra[基础设施层]
@@ -252,6 +253,8 @@ flowchart TB
     M0 --> M1 --> M2 --> M3 --> M4 --> M5 --> M6 --> M7
     M8 -.心跳刷新.-> M4
     M9 -.接管.-> M4
+    M14 -.判死线索.-> M9
+    M15 -.容量/续期锚定.-> M4
     M10 -.事件.-> M6
     M11 -.路由.-> M4
     M12 -.去重.-> M1
@@ -269,7 +272,9 @@ flowchart TB
 | CommitService | 幂等累积触发确认、增量合并 | committed_content、runtime_invocation（观测字段） |
 | CompletionService | Turn 终态判定、Session 推进 | runtime_invocation（终态）、admission（终态） |
 | LeaseHeartbeatService | 周期刷新三类租约 | lease_info（lease_type 区分） |
-| RecoveryService | 过期租约接管、Runtime 失联中断、卡死检测 | 租约表 + 状态表扫描 |
+| RecoveryService | RecoveryCoordinator 统一巡检入口：过期租约接管、Runtime 失联中断、卡死检测、activating 卡死回收（leaderless/leader 模式开关） | 租约表 + 状态表扫描 |
+| PodHealthProbe | 两段式判死：Nacos 线索 + `/internal/health` 确证（2s 超时、lastPollAt <30s 新鲜、30s 节流）；结论仅记日志/指标，**判死≠接管** | 内存缓存，不落库 |
+| InflightRegistry | 本 Pod 内存执行注册表：容量计数（running_count）+ Nacos 观测上报 + lease 续期锚定 | 纯内存，不落库 |
 | SSEPushService | Delta 写 Redis Stream、按活跃 Attempt 过滤推送 | Redis Stream |
 
 ### 4.5 关键处理流程（Level 0）
@@ -278,11 +283,10 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-    A[会话管理<br/>Turn 创建事务<br/>写 turn_ready_outbox] --> B[TurnScheduler<br/>claim 消费 Outbox<br/>PENDING→CLAIMED]
-    B --> C{Inbox 去重}
-    C -- 重复 --> X[跳过<br/>ack 置 DONE]
-    C -- 新 Turn --> D[写 turn_admission<br/>WAITING<br/>INBOX+queue 合一：落账即入队]
-    D --> D1[ack 置 DONE]
+    A[Gateway 对外 API<br/>同步调会话管理 submit<br/>拿回执（A1 外部契约）] --> B[回执幂等落账 turn_admission<br/>INBOX+queue 合一：落账即入队]
+    B --> C{幂等键去重}
+    C -- 重复 --> X[静默跳过<br/>ON CONFLICT DO NOTHING]
+    C -- 新回执 --> D[turn_admission<br/>WAITING<br/>（原 turn_ready_outbox 消费已废弃，D1/D15）]
     D --> F{同 Session 是否空闲?}
     F -- 忙 --> G[等待 Lease 释放]
     F -- 空闲 --> H[SKIP LOCKED 激活<br/>ACTIVATED]
@@ -295,10 +299,19 @@ flowchart TD
     N -- 是 --> O[幂等写 committed_content<br/>Redis Stream 推送 Delta]
     N -- 否 --> M
     M --> P{终态事件?}
-    P -- 是 --> Q[完成判定<br/>COMPLETED/INTERRUPTED]
+    P -- 是 --> Q[完成判定<br/>COMPLETED/FAILED/CANCELLED]
     Q --> R[Session 推进<br/>释放 Lease]
     R --> F
 ```
+
+**调度与恢复关键补充（v2 决策同步）：**
+
+- **容量门控（决策 10）**：本 Pod `running_count`（InflightRegistry 未过期 lease 计数）≥ `max_running`（Nacos 动态配置 `turn-scheduler.max-running-turns.per-pod`，默认 30~50）时暂停竞争激活；集群均衡 = 竞争 + 门控 + poll jitter 三者叠加，验收：各 Pod 并发最大/最小比 < 2。
+- **Runtime 自动重派（决策 6）**：下拨失败 / Runtime 失联，同一 Attempt 自动重派 ≤5 次（退避 1s→2s→4s→8s→16s），超限 Attempt 中断（admission → FAILED，fail_reason='RETRY_EXCEEDED'）。
+- **activating 卡死回收（决策 3）**：10s 巡检、60s 阈值，`FOR UPDATE SKIP LOCKED` + CAS 回退 QUEUED，session 租约唯一键兜底防双活。
+- **两段式判死（决策 8/9）**：Nacos 线索 → `/internal/health` 确证（2s 超时、lastPollAt <30s 新鲜、30s 节流）；判死只记日志/指标，**判死≠接管**，接管永远经 PG 租约 + epoch 递增 + 新 fencing token。
+- **SSE 断连 ≠ 死亡（决策 5）**：自动重连 1s→30s 指数退避 + jitter，4min 窗口内按 event_seq 续读；4min < 判据 2 的 5min 阈值。
+- **executing 故障 = 情形 c（决策 4）**：v1 一律中断 Attempt，不做续跑。
 
 ### 4.6 一致性设计概述（三类 Lease）
 
@@ -320,12 +333,12 @@ flowchart TD
 
 | 项 | 说明 |
 |---|---|
-| 方式 | Outbox/Inbox 模式（异步持久化）：会话管理写 `turn_ready_outbox`（OUTBOX，与 Turn 同事务），TurnScheduler 经消费接口 claim 拉取 |
-| 数据 | session_id、turn_id、attempt_id、context_ref、payload（TurnReady 完整消息体） |
-| 消费接口 | `claimTurnReady(batchSize, podId)` → 命中消息列表；`ackTurnReady(messageIds, podId)` → 确认落账 |
-| claim 语义 | 消息状态 `PENDING → CLAIMED → DONE`；claim 租约 30s，崩溃超时自动回 `PENDING` |
-| 幂等 | 以 `(session_id, turn_id, attempt_id)` 为 Inbox（turn_admission）幂等键，重复投递被静默吸收 |
-| 落账顺序 | 先 Inbox 落账（ON CONFLICT DO NOTHING）后 ack，禁止先 ack 后落账 |
+| 方式 | 同步提交通道（决策 D1/D15，废弃 outbox）：Gateway 对外 API（submitTurn）**同步调**会话管理 `submit`（A1）拿回执，回执幂等落账 `turn_admission`（INBOX + queue 合一） |
+| 数据 | session_id、turn_id、attempt_id、context_ref、receipt_body（回执完整消息体，用于幂等落账） |
+| 对外接口 | `submitTurn(sessionId, input)` → Attempt#1；`retryTurn(turnId)` → Attempt#N（新租约新 Watermark，前端无感） |
+| 回执语义 | 会话管理事务内创建 Turn + Attempt（业务权威，D7），返回回执；Gateway 以 `(session_id, turn_id, attempt_id)` 幂等落账，重复 submit 被 ON CONFLICT 吸收 |
+| 幂等 | 惯性键 `(session_id, turn_id, attempt_id)`（决策 D15）；用户防重放前移 Gateway 对外 API |
+| 落账顺序 | 先落账后响应；落账成功但响应丢失 → 上游重试同 submit → 幂等键吸收，不产生重复队列元素 |
 
 **E2：TurnScheduler → Runtime（调拨下拨）**
 
@@ -343,15 +356,15 @@ flowchart TD
 | 结构 | Redis Stream：`turn_events:<session_id>`，事件带单调 sequence |
 | 写入 | 每条 { session_id, turn_id, attempt_id, sequence, type, payload } |
 | TTL/裁剪 | TTL 10 分钟 + maxlen 裁剪，可丢不丢内容 |
-| 消费 | 持有 SSE 连接者，按水位 `XRANGE +` 续读 |
+| 消费 | 持有 SSE 连接者，按水位 `XRANGE +` 续读；断连自动重连（1s→30s 指数退避 + jitter，4min 窗口），断连≠死亡，重连后按 event_seq 续读 |
 
 **E4：TurnScheduler → Nacos（注册发现）**
 
 | 项 | 说明 |
 |---|---|
-| 功能 | 自身注册、Runtime 实例发现、健康感知 |
-| 用法 | 调度选型时过滤心跳超时 / readiness=false 实例 |
-| 注意 | 只缩短发现时间，不替代租约做安全接管 |
+| 功能 | 自身注册、Runtime 实例发现、健康感知、**观测上报（纯观测）** |
+| 用法 | 调度选型时过滤心跳超时 / readiness=false 实例；每 5s 上报本 Pod InflightRegistry 快照（容量观测） |
+| 注意 | 只缩短发现时间，不替代租约做安全接管；**上报值调度决策永不引用** |
 
 **E5：TurnScheduler → PostgreSQL（权威存储）**
 
@@ -365,7 +378,7 @@ flowchart TD
 
 | 编号 | 调用方 → 被调方 | 语义 |
 |---|---|---|
-| I1 | M0 → M1 | 消费的 Outbox 消息送入准入 |
+| I1 | M0 → M1 | 同步回执（submit 返回）送入准入落账 |
 | I2 | M1 → M2 | 准入通过后入队 |
 | I3 | M2 → M3 | 激活后冻结上下文 |
 | I4 | M3 → M4 | 冻结完成，创建 Invocation |
@@ -384,25 +397,14 @@ flowchart TD
 
 ```mermaid
 erDiagram
-    TURN_READY_OUTBOX ||--o{ TURN_ADMISSION : "claim 消费（INBOX+queue 合一）"
     TURN_ADMISSION ||--o{ RUNTIME_INVOCATION : "执行产生"
     TURN_ADMISSION ||--o{ COMMITTED_CONTENT : "确认累积"
     RUNTIME_INVOCATION ||--o| INVOCATION_SPEC : "冻结"
-    RUNTIME_INVOCATION ||--o{ LEASE_INFO : "双层租约（session+controller）"
+    RUNTIME_INVOCATION ||--o| LEASE_INFO : "双层租约（session+controller）"
     RUNTIME_INVOCATION ||--o| COMMITTED_CONTENT : "内容确认"
 
-    TURN_READY_OUTBOX {
-        bigint id PK
-        varchar session_id
-        bigint turn_id
-        bigint attempt_id
-        varchar status
-        varchar claimed_by
-        timestamp claim_expire_at
-    }
     TURN_ADMISSION {
         bigint id PK
-        bigint outbox_id FK
         uuid session_id FK
         uuid turn_id
         uuid attempt_id
@@ -459,13 +461,13 @@ erDiagram
 | lease_info | 双层租约：session 串行执行权 + controller 控制权（以 lease_type 区分） | 短期 | 活跃期 |
 | committed_content | 确认内容（权威） | 长期 | 永久保留 |
 
-**会话管理库（OUTBOX，接口约定表）：**
+**会话管理侧（业务权威，由会话管理维护）：**
 
 | 表 | 用途 | 数据量级 | 生命周期 |
 |---|---|---|---|
-| turn_ready_outbox | TurnReady 事务消息（**OUTBOX**，与 Turn 同事务写入，4.1.1 参考 DDL） | 中短期 | PENDING 消费后清理 |
+| Turn / Attempt / Session / Context | 业务元数据与上下文正文（权威，Gateway 侧 committed_content 仅镜像/缓存，决策 D2/D3） | 中长期 | 会话管理维护 |
 
-> 注：会话管理侧（Turn/Attempt/Session/Context）由 Gateway 侧维护，本模块只引用 `session_id / turn_id / attempt_id / context_ref`，不建元数据表。`turn_ready_outbox` 是唯一的跨库接口表，调度模块通过消费接口（E1）读写，不直接持有其建表权限。
+> 注：会话管理侧表由会话管理维护，本模块只经同步接口（A1~A12）引用 `session_id / turn_id / attempt_id / context_ref`，不建元数据表、不直接持有其访问权限。**不再存在跨库 outbox 接口表**（决策 D1/D15，废弃 turn_ready_outbox）。
 
 ---
 
@@ -477,9 +479,11 @@ erDiagram
 |---|---|---|
 | 基础设施故障 | Gateway Pod 宕机 | L0 主动释放 / L1 Nacos+节点证据提前接管 / L2 租约过期兜底 |
 | 调度侧故障 | TurnScheduler Pod 崩溃 | 心跳停更 → 其他 Pod 接管（controller_epoch 递增） |
-| 执行侧故障 | Runtime 失联/崩溃 | 租约过期 → Attempt 标记 INTERRUPTED，已确认内容保留 |
-| 数据竞争 | 双 Pod 同时 claim | SKIP LOCKED 保证唯一性，败者重试 |
-| 重复投递 | Outbox/事件重复 | Inbox 幂等键 + Committed 幂等键（seq） |
+| 执行侧故障 | Runtime 失联/崩溃 | 自动重派 ≤5 次（退避 1s→2s→4s→8s→16s）；耗尽且无可用 Runtime → invocation `paused` 挂起巡检唤醒（12.2.1）；INFRA_RETRY 超限 → Turn `FAILED`（fail_reason='RETRY_EXCEEDED'，等用户 USER_RETRY，D28），已确认内容保留 |
+| 调度侧故障 | activating 卡死（协调者死于激活中途） | 10s 巡检 + 60s 阈值回收回 QUEUED（SKIP LOCKED + CAS，session 租约兜底） |
+| 协调者疑似死亡 | Nacos 心跳超时 | 两段式判死：`/internal/health` 确证（2s 超时 / 30s 节流）；判死≠接管，接管经 PG 租约 + epoch 递增 + 新 fencing token |
+| 数据竞争 | 双 Pod 同时激活/接管 | SKIP LOCKED 保证唯一性，败者重试 |
+| 重复投递 | submit 重放/事件重复 | 同步回执幂等键 (session_id,turn_id,attempt_id) + Committed 幂等键（seq） |
 | 内容丢失 | Delta 未达 Redis | 不丢内容：权威在 committed_content，Delta 可重建 |
 
 ### 7.2 兜底原则
@@ -508,6 +512,7 @@ erDiagram
 ### 9.1 容量结论（详见 v2 第 16 章）
 
 - 稳态需求 20~50 turns/s，极端峰值 <150 turns/s；
+- 单 Pod 并发由 `turn-scheduler.max-running-turns.per-pod`（默认 30~50，Nacos 动态配置）门控，容量观测经 InflightRegistry 上报；
 - 单 PG 优化后可承载峰值 150~200 turns/s，稳态安全 80~100；
 - **瓶颈在大头在 Runtime 池规模（~95 Pod）与模型 API 配额，不在调度器**。
 
@@ -583,6 +588,7 @@ flowchart TB
 | 队列指标 | pending 队列深度、等待时长分布 |
 | 流式指标 | Delta 延迟 P95、Stream 积压量 |
 | 组件健康 | PG 连接池、Redis 连接、Nacos 心跳 |
+| 恢复观测 | takeover_attempt_total（按 outcome）、pod_health_event_total（confirmed/alive）、inflight_running_count、inflight_gate_hit_total |
 
 ### 11.2 告警
 

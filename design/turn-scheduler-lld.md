@@ -18,7 +18,7 @@
 
 ### 1.2 范围
 
-实现范围：TurnScheduler 调度侧服务（Spring Boot），含 5 张 Gateway 侧表、三类 Lease、7 阶段调度流水线、流式 Delta 推送、故障恢复。不含 Gateway 会话管理侧实现（仅接口对接）。跨库接口表 `turn_ready_outbox`（OUTBOX，位于会话管理库）由会话管理侧建表，本模块通过消费接口（E1）claim/ack 消费，并在 3.1 给出**参考 DDL 与消费契约**以保证两侧落地一致。
+实现范围：TurnScheduler 调度侧服务（Spring Boot），含 5 张 Gateway 侧表、三类 Lease、7 阶段调度流水线、流式 Delta 推送、故障恢复。不含 Gateway 会话管理侧实现（仅接口对接）。**同步提交通道（决策 D1/D15，废弃 outbox）**：Gateway 同步调会话管理 `submit` 拿回执（A1 外部契约），回执幂等落账 `turn_admission`（INBOX 即调度队列）；`Attempt` 业务记录只由会话管理创建（D7），本模块只消费 `attempt_id` 建 Invocation。本模块经同步接口（A1~A12 外部契约）调用，不再存在跨库 OUTBOX 消费。
 
 ### 1.3 引用文档
 
@@ -56,12 +56,17 @@
 
 ```text
 while (running) {
-    // 1. 消费 Outbox：claim 一批（PENDING→CLAIMED，30s 租约）
-    List<TurnReadyMessage> msgs = outboxClient.claim(batchSize);
-    for (TurnReadyMessage m : msgs) {
-        TurnAdmissionService.admit(m)
-        outboxClient.ack(m.id);   // 先 Inbox 落账，后 ack
+    // 0. 容量门控（决策 10）：本 Pod 内存计数已达上限则整轮暂停
+    if (!inflightRegistry.hasCapacity()) {
+        metrics.inc("inflight_gate_hit");
+        sleep(poll_interval);
+        continue;
     }
+
+    // 1. 同步回执落账（决策 D1/D15，替代原 Outbox 消费）：
+    //    Gateway 对外 API 接收 submitTurn 时同步调会话管理 submit 拿回执
+    //    （A1 外部契约），回执幂等落账 turn_admission 即完成准入——不在 poll 循环内消费跨库队列
+    //    回执落账幂等键 = (session_id, turn_id, attempt_id)，重复 submit 由 ON CONFLICT 吸收
 
     // 2. 激活排队
     TurnQueueActivationService.pollAndActivate()
@@ -72,68 +77,70 @@ while (running) {
     // 4. 心跳
     LeaseHeartbeatService.refreshAll()
 
-    sleep(poll_interval)
+    sleep(poll_interval + jitter())   // poll jitter：多 Pod 错峰竞争（均衡手段之一）
 }
 ```
 
 | 配置项 | 默认值 |
 |---|---|
 | poll_interval | 200ms |
-| outbox_batch_size | 50 |
-| outbox_claim_lease | 30s（claim 后未 ack 超时回 PENDING） |
 | activation_batch_size | 10 |
 | dispatch_batch_size | 10 |
+| max_running_turns_per_pod | 30~50（Nacos 动态配置 `turn-scheduler.max-running-turns.per-pod`，热生效） |
+| redispatch_max_attempts | 5 |
+| redispatch_backoff | 1s / 2s / 4s / 8s / 16s |
 
 ### 2.2 TurnAdmissionService（M1）
 
-**消息定义（对应 turn_ready_outbox 一行，跨库消息契约）：**
+**消息定义（同步回执，对应会话管理 `submit` 返回，跨服务契约 A1）：**
 
 ```java
-public record TurnReadyMessage(
-    long    outboxId,       // turn_ready_outbox.id
+public record SubmitReceipt(
     String  sessionId,
     String  turnId,
-    String  attemptId,
-    String  contextRef,     // 可空：冻结阶段再构建
-    String  payload         // TurnReady 完整消息体
+    String  attemptId,     // Attempt#1（submit）/ Attempt#N（retry，D7：Attempt 业务记录只由会话管理创建）
+    String  contextRef,    // 可空：冻结阶段再构建
+    String  receiptBody    // 回执完整消息体（幂等落账用）
 ) {}
 ```
 
-**处理流程：**
+**处理流程（Gateway 对外 API submitTurn → 同步通道，决策 D1/D15）：**
 
 ```text
-1. claim：outboxClient.claim(batchSize)
-   -> 会话管理库内 UPDATE ... WHERE status='PENDING' SKIP LOCKED
-      SET status='CLAIMED', claimed_by=:pod, claim_expire_at=now()+30s RETURNING *
-2. 对每条消息 m：
+1. Gateway 接收 submitTurn（前端 API，11.3）
+2. 同步调会话管理 submit：POST /v1/turn/submit（A1）
+   -> 会话管理事务内创建 Turn + Attempt#1（PENDING），返回回执 { turn_id, attempt_id, session_id }
+3. 回执幂等落账（同步，本地事务）：
    a. inbox 幂等键 = (session_id, turn_id, attempt_id)
    b. INSERT INTO turn_admission (..., status='WAITING') ... ON CONFLICT DO NOTHING
-      // INBOX + queue 合一：落账即入队，不再二次写 pending_turn_queue
+      // INBOX + queue 合一：落账即入队，不再二次写 pending_turn_queue（替代原 turn_ready_outbox 消费）
    c. 若插入成功（新 Attempt）：已入队（WAITING），凭 admission 行参与 SKIP LOCKED 竞争
-   d. ack：outboxClient.ack(m.outboxId)   // 先落账后 ack，m 置 DONE
+   d. 若冲突（重复回执）：静默跳过，视为已准入（用户防重放已前移 Gateway 对外 API）
 ```
 
 **输入输出：**
 
 | 方向 | 数据 | 说明 |
 |---|---|---|
-| 入 | TurnReadyMessage { outboxId, session_id, turn_id, attempt_id, context_ref, payload } | 会话管理事务写出的 OUTBOX 消息 |
+| 入 | SubmitReceipt { session_id, turn_id, attempt_id, context_ref, receipt_body } | 会话管理 submit 同步回执（A1 外部契约） |
 | 出 | admission_id（admission 行即队列元素） | 后续流程凭 admission_id 追踪 |
 
 **异常处理：**
 
 | 异常 | 处理 |
 |---|---|
-| claim 失败（接口超时） | 下一轮重试（消息仍在 PENDING，无副作用） |
-| admit 阶段失败 | **不 ack**，claim 租约 30s 后自动回 PENDING，其他 Pod 重领 |
+| submit 调用失败（RPC 超时/不可用） | 对外返回失败，前端可重试；无半落库风险（会话管理事务未提交则无回执，Gateway 无落账） |
+| 落账失败（本地事务异常） | 本地事务回滚，不产生残缺 admission 行；重试由用户/上游重发，幂等键吸收 |
 | 入队冲突 | ON CONFLICT 静默跳过，视为已准入 |
-| ack 失败 | 消息停留 CLAIMED，租约过期回 PENDING 后被重领；Inbox 幂等保证重领不产生重复数据 |
+| 落账成功但响应丢失 | 回执幂等重放：重发同 submit 时 ON CONFLICT 吸收，不产生重复队列元素 |
 
 ### 2.3 TurnQueueActivationService（M2）
 
 **核心竞争 SQL（串行激活，INBOX+queue 合一后直接竞争 admission 行）：**
 
 ```sql
+-- 决策 12 优化版：一步排除有活动 session 租约的 Session（LEFT JOIN lease_info）
+-- 安全不变：Session Lease 唯一键 + CAS（见 2.5）仍是最终兜底
 update turn_admission a
 set status = 'ACTIVATING',
     activated_at = now(),
@@ -141,12 +148,12 @@ set status = 'ACTIVATING',
 where a.id = (
     select a2.id
     from turn_admission a2
+    left join lease_info l
+           on l.lease_type = 'session'
+          and l.session_id  = a2.session_id
+          and l.lease_until > now()          -- 忙碌 session 的租约未过期
     where a2.status = 'WAITING'
-      and not exists (
-          select 1 from runtime_invocation ri
-          where ri.session_id = a2.session_id
-            and ri.status in ('ADMITTED','FREEZING','FROZEN','ACTIVATING','ACTIVATED','DISPATCHED','EXECUTING')
-      )
+      and l.id is null                       -- 仅竞争空闲 Session 的排队行
     order by a2.priority, a2.created_at
     limit 1
     for update skip locked
@@ -220,6 +227,13 @@ where lease_type = 'controller' and session_id = :s and invocation_id = :i and c
 4. 选择实例，下拨执行
 5. 更新 runtime_invocation: status=INVOCATION_DISPATCHED, runtime_replica_id=:replica
 6. 游程开始（fencing_token 继承）
+
+下拨失败 / Runtime 失联自动重派（决策 6）：
+  同一 Attempt 重派 ≤ 5 次，退避 1s/2s/4s/8s/16s（参数见 2.1）
+  每次重派重新执行步骤 1~5（重新选实例 + 签发新 fencing_token）
+  5 次仍失败且无可用 Runtime -> invocation 置 PAUSED 挂起（巡检唤醒，12.2.1）
+     始终无可用 Runtime / INFRA_RETRY 超限 -> admission 置 FAILED
+     fail_reason='RETRY_EXCEEDED'、Attempt 判 FAILED、Turn FAILED 等 USER_RETRY（D28）
 ```
 
 **下拨数据（SchedulingContext）：**
@@ -245,7 +259,7 @@ where lease_type = 'controller' and session_id = :s and invocation_id = :i and c
 | assistant_content_committed | TurnConfirmService | 幂等写 committed_content |
 | runtime_event（tool 等） | 记录 + 推送 | runtime_invocation 观测字段推进（event_sequence / progress_note） |
 | invocation_completed | TurnCompletionService | 终态判定 |
-| invocation_failed | TurnCompletionService | INTERRUPTED |
+| invocation_failed | TurnCompletionService | FAILED（fail_reason 溯源，D28） |
 
 **幂等确认 SQL（关键）：**
 
@@ -273,8 +287,10 @@ where ri.invocation_id = :id and ri.committed_seq = :old_seq;
 ```text
 确认内容追平 init_seq + 收到 invocation_completed
   -> status = COMPLETED，写会话侧终态事件，释放租约
-或：失败/中断判定
-  -> status = INTERRUPTED，保留已确认内容，可重试
+或：失败判定（已 commit 异常 / 副作用结果未知）
+  -> status = FAILED（fail_reason 溯源），保留已确认内容，Turn 走 INFRA_RETRY（超限等 USER_RETRY，D28）
+或：用户取消（cancelTurn -> abort）
+  -> status = CANCELLED，保留已确认内容（D28）
 ```
 
 **完成 SQL：**
@@ -298,11 +314,13 @@ delete from lease_info where lease_type = 'controller' and invocation_id = :id;
   -> Runtime 侧旧请求因 fencing 过期被拒
 ```
 
-**中断（Runtime 失联）：**
+**失联处置（Runtime 事件停滞，D28）：**
 
 ```text
 扫描 executing 但 runtime_invocation.updated_at 停滞（观测字段不再推进）+ Runtime 心跳超时
-  -> Attempt 标 INTERRUPTED，通知前端可重试
+  -> 按 commit 分界（12.2）：
+     未 commit -> 同一 Attempt 内自动重派（2.6）/ 无可用 Runtime 置 PAUSED 挂起
+     已 commit -> Attempt 判 FAILED（fail_reason 溯源），Turn 自动 INFRA_RETRY 新 Attempt
   -> 不拼接：新 Attempt 新租约新 Watermark
 ```
 
@@ -323,6 +341,40 @@ select ri.invocation_id, ri.event_sequence, ri.updated_at
 from runtime_invocation ri
 where ri.updated_at < now() - interval '5 minutes'
   and ri.status in ('DISPATCHED','EXECUTING');
+
+-- 判据 3：activating 卡死（激活中途协调者死亡，决策 3）
+-- 10s 巡检节奏、60s 阈值；回收 = FOR UPDATE SKIP LOCKED + CAS 回退 WAITING
+select a.id as admission_id, a.session_id, a.updated_at
+from turn_admission a
+where a.status = 'ACTIVATING'
+  and a.updated_at < now() - interval '60 seconds';
+```
+
+**执行入口（决策 7）：统一收敛到 RecoveryCoordinator，全员巡检 + 模式开关：**
+
+```java
+public interface RecoveryCoordinator {
+    RecoveryMode mode();                            // leaderless（默认，v1） | leader（预留，v2）
+    void onHealthProbeResult(PodHealthProbe.Result r);
+    void runRecoveryCycle();                        // 回收过期租约 + 卡死判定（含判据 3）
+    void takeover(TakeoverContext ctx);             // 经 PG 租约 + epoch 递增 + 新 fencing token
+}
+```
+
+**两段式判死（决策 8/9，独立于接管，只产观测结论）：**
+
+```text
+第一段 线索（Nacos）:  心跳超时 -> 候选死亡 Pod（30s 节流缓存，不落库）
+第二段 确证（探测）:   GET /internal/health，2s 超时；lastPollAt 距当前 <30s 视为新鲜
+                     连续失败 -> 疑似死亡（仅记日志 + 指标 pod_health_event_total）
+红线: 判死 ≠ 接管 —— 接管永远走 lease_info 租约 + epoch + fencing（下方 4.3）
+```
+
+```json
+// /internal/health 契约（Gateway 内部接口，独立于 K8s 探针）
+{ "podId": "gateway-7f9c2d", "status": "ACTIVE",
+  "lastPollAt": "2026-09-13T10:00:00Z",
+  "lastHeartbeatAt": "2026-09-13T10:00:00Z" }
 ```
 
 ### 2.10 TurnStreamPushService（M10）
@@ -342,6 +394,8 @@ TTL: EXPIRE turn_events:<session_id> 600
   XRANGE turn_events:<session_id> <watermark+1> +
 过滤: attempt_id == 当前活跃 attempt 才推送
 控制事件: attempt 切换时推 stream_reset（见 11.3 契约）
+断连重连（决策 5）: SSE 传输层断连 ≠ 死亡；客户端自动重连（1s→30s 指数退避 + jitter，
+  4min 窗口）后按 event_seq 续读；4min < 判据 2 的 5min 阈值，重连窗口落在官方恢复时序内
 ```
 
 ### 2.11 ShardRouter（M11）
@@ -358,75 +412,27 @@ shard_id = Math.floorMod(session_id.hashCode(), N)   // N 配置化，v1 = 1
 
 ### 3.1 表结构与 DDL
 
-**gateway 侧（调度模块拥有，5 张）。** 另含 1 张会话管理库接口表（3.1.1，OUTBOX，本模块只消费不建表）。
+**gateway 侧（调度模块拥有，5 张）。** 会话管理侧表（Turn/Attempt/Session/Context）由会话管理维护，本模块经同步接口（A1~A12）交互；**不再存在跨库 OUTBOX 接口表**（决策 D1/D15，废弃 outbox）。
 
-#### 3.1.1 turn_ready_outbox（会话管理库 · OUTBOX，接口契约）
+#### 3.1.1 turn_admission（同步回执落账 + 调度队列，Gateway 侧幂等准入）
 
-> 由会话管理侧建表，本模块仅在消费接口（E1）中读写。此处给出参考 DDL，用于双方对齐字段与状态语义。
-
-```sql
-create table turn_ready_outbox (
-    id               bigserial primary key,
-    session_id       uuid      not null,
-    turn_id          uuid      not null,
-    attempt_id       uuid      not null,        -- Attempt 粒度：重试产生新 Attempt = 新消息
-    context_ref      uuid,
-    payload          jsonb     not null,
-    status           varchar   not null default 'PENDING',  -- PENDING/CLAIMED/DONE/DEAD
-    claimed_by       varchar,
-    claim_expire_at  timestamptz,
-    attempt_count    int       not null default 0,
-    created_at       timestamptz not null default now(),
-    updated_at       timestamptz not null default now(),
-    unique (session_id, turn_id, attempt_id)    -- 写入侧幂等
-);
-
-create index idx_outbox_pending       on turn_ready_outbox (id) where status = 'PENDING';
-create index idx_outbox_claim_expiry  on turn_ready_outbox (claim_expire_at) where status = 'CLAIMED';
-```
-
-**claim 语义（会话管理库内单语句，消费接口内部逻辑）：**
-
-```sql
-update turn_ready_outbox o
-set status = 'CLAIMED',
-    claimed_by = :pod,
-    claim_expire_at = now() + interval '30 seconds',
-    attempt_count = attempt_count + 1,
-    updated_at = now()
-where o.id in (
-    select id from turn_ready_outbox
-    where status = 'PENDING'
-    order by id
-    for update skip locked
-    limit :batch_size
-)
-returning o.id, o.session_id, o.turn_id, o.attempt_id, o.context_ref, o.payload;
-```
-
-**ack 语义：**
-
-```sql
-update turn_ready_outbox
-set status = 'DONE', updated_at = now()
-where id in (:ids) and claimed_by = :pod and status = 'CLAIMED';
-```
-
-**租约回收（会话管理侧后台任务）：** `UPDATE ... SET status='PENDING', claimed_by=NULL WHERE status='CLAIMED' AND claim_expire_at < now();`
-
-#### 3.1.2 turn_admission（INBOX + 调度队列，幂等消费台账）
+> **同步提交通道（决策 D1/D15，替代原 turn_ready_outbox + pending_turn_queue）**：Gateway 同步调会话管理 submit 拿回执，回执幂等落账即为准入——INBOX 落账与入队合一，`priority` 与排队语义由 admission 行自身承载；消息出表（原 turn_ready_outbox）不再存在，无 claim/ack/租约回收概念。
 
 > **表合并说明（方案A）：** 原 `pending_turn_queue` 并入本表——INBOX 幂等落账（admitted）与入队（waiting）合一，`priority` 与排队语义由 admission 行自身承载，消除双写窗口；Phase 2 SKIP LOCKED 直接竞争本表 `status='WAITING'` 的行。
 
 ```sql
 create table turn_admission (
     id            bigserial primary key,            -- 调度侧主键
-    outbox_id     bigint,                           -- OUTBOX 消息溯源（ack 后回填，可空）
     session_id    uuid      not null,               -- 会话（分片键）
     turn_id       uuid      not null,
     attempt_id    uuid      not null,
     context_ref   uuid      not null,               -- 冻结上下文引用
-    status        varchar   not null default 'WAITING',  -- 状态机：WAITING(入队即准入) -> FREEZING -> FROZEN -> ACTIVATING -> ACTIVATED -> COMPLETED / DEAD / CANCELLED
+    status        varchar   not null default 'WAITING',  -- 状态机：WAITING(入队即准入) -> FREEZING -> FROZEN -> ACTIVATING -> ACTIVATED -> COMPLETED / FAILED / DEAD / CANCELLED
+    failed_from   varchar,                          -- 终态溯源：进入 FAILED 前的最后状态（决策 11）
+    fail_reason   varchar,                          -- COORDINATOR_DEAD / RUNTIME_STALLED / RETRY_EXCEEDED / DISPATCH_REJECTED
+    failed_at     timestamptz,
+    cancelled_from varchar,                         -- 终态溯源：进入 CANCELLED 前的最后状态
+    cancel_reason varchar,                          -- 终态溯源：用户取消（D28：系统故障一律走 failed + fail_reason）
     priority      int       not null default 0,     -- 调度优先级（原 queue 语义）
     admitted_at   timestamptz,
     frozen_at     timestamptz,
@@ -435,14 +441,11 @@ create table turn_admission (
     completed_at  timestamptz,
     created_at    timestamptz not null default now(),
     updated_at    timestamptz not null default now(),
-    unique (session_id, turn_id, attempt_id)        -- Inbox 幂等键（OUTBOX 消息幂等）
+    unique (session_id, turn_id, attempt_id)        -- 同步回执幂等键（决策 D15，用户防重放前移 Gateway 对外 API）
 );
-
-create index idx_admission_session on turn_admission (session_id, created_at desc);
-create index idx_admission_claim    on turn_admission (priority, created_at) where status in ('WAITING','ACTIVATING');
 ```
 
-#### 3.1.3 runtime_invocation（执行工单 + Runtime 观测）
+#### 3.1.2 runtime_invocation（执行工单 + Runtime 观测）
 
 > **表合并说明（方案A）：** 原 `runtime_observed_state` 并入本表（1:1 冗余）——`runtime_status / event_sequence / progress_note` 观测字段由 Runtime 事件单调推进，只用于健康感知与卡死判定，不参与状态机。
 
@@ -453,7 +456,7 @@ create table runtime_invocation (
     turn_id           uuid      not null,
     attempt_id        uuid      not null,
     admission_id      bigint    not null references turn_admission(id),
-    status            varchar   not null,   -- ADMITTED/FREEZING/FROZEN/ACTIVATING/ACTIVATED/DISPATCHED/EXECUTING/PAUSED/COMPLETED/TERMINATED/INTERRUPTED/FAILED
+    status            varchar   not null,   -- ADMITTED/FREEZING/FROZEN/ACTIVATING/ACTIVATED/DISPATCHED/EXECUTING/PAUSED/COMPLETED/TERMINATED/FAILED/CANCELLED（D28：无 INTERRUPTED，用户取消=CANCELLED）
     priority          int       not null default 0,
     committed_seq     bigint    not null default 0,
     init_seq          bigint    not null default 0,
@@ -476,7 +479,7 @@ create index idx_invocation_pending  on runtime_invocation (priority, id) where 
 create index idx_invocation_stuck    on runtime_invocation (updated_at) where status in ('DISPATCHED','EXECUTING') and event_sequence >= 0;
 ```
 
-#### 3.1.4 invocation_spec
+#### 3.1.3 invocation_spec
 
 ```sql
 create table invocation_spec (
@@ -488,7 +491,7 @@ create table invocation_spec (
 );
 ```
 
-#### 3.1.5 lease_info（统一租约：Session + Controller）
+#### 3.1.4 lease_info（统一租约：Session + Controller）
 
 > **表合并说明（方案A）：** 原 `session_lease` 与 `controller_lease` 合并为一张表，以 `lease_type` 区分；Runtime 侧 fencing token 为运行时内存语义（见 6.2），不在此落库。
 
@@ -508,7 +511,7 @@ create table lease_info (
 create index idx_lease_expiry on lease_info (lease_until) where lease_until < now();
 ```
 
-#### 3.1.6 committed_content
+#### 3.1.5 committed_content
 
 ```sql
 create table committed_content (
@@ -531,8 +534,7 @@ create index idx_committed_session on committed_content (session_id, created_at 
 
 | 表 | 关键索引 | 目的 |
 |---|---|---|
-| turn_ready_outbox | (id) where PENDING、(claim_expire_at) where CLAIMED | claim/租约回收扫描（会话管理库） |
-| turn_admission | unique(session_id,turn_id,attempt_id)；idx_admission_claim (priority,created_at) where WAITING/ACTIVATING | Inbox 幂等 + SKIP LOCKED 竞争扫描 |
+| turn_admission | unique(session_id,turn_id,attempt_id)；idx_admission_claim (priority,created_at) where WAITING/ACTIVATING | 同步回执幂等 + SKIP LOCKED 竞争扫描 |
 | runtime_invocation | (status,q) partial；idx_invocation_stuck (updated_at) where DISPATCHED/EXECUTING | 调度待办扫描 + 卡死检测 |
 | lease_info | unique(lease_type,session_id)、unique(lease_type,invocation_id)、(lease_until) where < now() | 串行约束 + 单控制者 + 租约回收 |
 | committed_content | unique(invocation_id,seq) | 幂等确认 |
@@ -542,8 +544,8 @@ create index idx_committed_session on committed_content (session_id, created_at 
 
 | 规则 | 说明 |
 |---|---|
-| 长事务禁止 | 任何 SQL 不跨越网络调用（Runtime 下拨在事务外） |
-| claim 单语句 | 使用 CTE + UPDATE ... RETURNING 原子完成 |
+| 长事务禁止 | 任何 SQL 不跨越网络调用（Runtime 下拨在事务外）；同步 submit 为外部 RPC，回执落账单独本地事务（决策 D1） |
+| 竞争单语句 | Phase 2 激活 / 过期租约回收使用 CTE + UPDATE ... RETURNING 原子完成 |
 | 事务内只写 PG | 不混 Redis/Nacos 写 |
 | 隔离级别 | READ COMMITTED（SKIP LOCKED 已足够） |
 
@@ -559,24 +561,22 @@ create index idx_committed_session on committed_content (session_id, created_at 
 
 ```mermaid
 sequenceDiagram
+    participant UI as 前端
+    participant GW as Gateway
     participant SM as 会话管理
-    participant SMPG as 会话管理库<br/>(turn_ready_outbox)
-    participant TS as TurnScheduler
     participant TSPG as Gateway库<br/>(turn_admission)
 
-    SM->>SMPG: [T] 写 Turn + 写 turn_ready_outbox（同事务）
-    TS->>SMPG: claim(batchSize, podId)&#xa;PENDING→CLAIMED（SKIP LOCKED + 30s 租约）
-    SMPG-->>TS: TurnReadyMessage[]（outbox_id 等）
-    loop 每条消息
-        TS->>TSPG: INSERT turn_admission (status=WAITING)&#xa;ON CONFLICT DO NOTHING&#xa;幂等键 (session_id, turn_id, attempt_id)&#xa;INBOX+queue 合一：落账即入队
-        alt 新 Attempt
-            TS->>TSPG: 已入队，凭 admission 行参与后续竞争
-        else 重复消息
-            TS->>TSPG: 静默跳过（Inbox 幂等）
-        end
-        TS->>SMPG: ack(outbox_id, podId)&#xa;CLAIMED→DONE（先落账后 ack）
+    UI->>GW: submitTurn (session_id, input, ...)
+    GW->>SM: POST /v1/turn/submit（同步，A1 外部契约）
+    SM->>SM: [T] 创建 Turn + Attempt#1（PENDING，业务权威，D7）
+    SM-->>GW: 回执 { turn_id, attempt_id, session_id }
+    GW->>TSPG: INSERT turn_admission (status=WAITING)&#xa;ON CONFLICT DO NOTHING&#xa;幂等键 (session_id, turn_id, attempt_id)&#xa;INBOX+queue 合一：落账即入队
+    alt 新回执
+        GW->>TSPG: 已入队，凭 admission 行参与后续竞争
+    else 重复回执
+        GW->>TSPG: 静默跳过（同步回执幂等，ON CONFLICT 吸收）
     end
-    Note over TS,SMPG: claim 后崩溃 → 租约30s过期回 PENDING → 其他 Pod 重领
+    Note over GW,TSPG: 落账成功但响应丢失 → 前端/上游重试同 submit → 幂等键吸收，不产生重复队列元素
 ```
 
 ### 4.2 调度与执行
@@ -610,7 +610,9 @@ sequenceDiagram
 
     OA->>PG: 心跳续约（30s/60s）...
     OA-->xPG: 宕机，停止心跳
-    PG-->>NB: 检测 lease_info controller 过期
+    NB->>NB: 两段式判死：Nacos 心跳线索 + /internal/health 确证（决策 8）
+    Note over NB: 判死≠接管：只缩短"何时尝试接管"的时机；接管需 PG 租约裁决
+    PG-->>NB: 检测 lease_info controller 过期（PG 为最终裁决）
     NB->>PG: controller_epoch = 旧epoch + 1 重获控制权
     NB->>PG: 生成新 fencing_token
     NB->>RT: 重新下拨（新 fencing_token）
@@ -641,29 +643,34 @@ sequenceDiagram
 
 ## 5. 状态机详细设计
 
-### 5.1 Turn 状态（会话管理侧）
+### 5.1 Turn 状态（会话管理侧，对齐 design.md 5.1 / D5 / D28）
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WAITING : 提交
-    WAITING --> RUNNING : 首个 Attempt 开始
+    [*] --> PENDING : 提交（submit）
+    PENDING --> RUNNING : 首次 commit 隐式触发
     RUNNING --> COMPLETED : 正式回答完成
-    RUNNING --> INTERRUPTED : 中断可重试
-    INTERRUPTED --> RUNNING : 用户重试(新 Attempt)
+    RUNNING --> FAILED : 故障终态（fail_reason 溯源，D28）
+    RUNNING --> CANCELLED : 用户手动停止（cancel，D28）
+    PENDING --> CANCELLED : 排队中取消（D28）
+    FAILED --> PENDING : 用户重试（USER_RETRY，新 Attempt）
+    CANCELLED --> PENDING : 用户重试（retryTurn，USER_RETRY 新 Attempt，D28）
     COMPLETED --> [*]
-    INTERRUPTED --> [*]
 ```
 
 ### 5.2 Attempt 状态（会话管理侧）
 
 ```mermaid
 stateDiagram-v2
-    [*] --> CREATED
-    CREATED --> EXECUTING
-    EXECUTING --> COMPLETED
-    EXECUTING --> INTERRUPTED
-    INTERRUPTED --> [*]
+    [*] --> PENDING : submit/retry 创建（D7）
+    PENDING --> RUNNING : 首次 commit 隐式触发
+    RUNNING --> COMPLETED : 提交完成
+    RUNNING --> FAILED : 已 commit 异常 / 副作用未知（fail_reason，D28）
+    RUNNING --> CANCELLED : 用户取消（SM.cancel 事务内同落，D28）
+    PENDING --> CANCELLED : 排队中取消（D28）
     COMPLETED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
 ```
 
 ### 5.3 RuntimeInvocation 状态（调度侧）
@@ -678,14 +685,17 @@ stateDiagram-v2
     ACTIVATING --> ACTIVATED : 激活成功
     ACTIVATED --> DISPATCHED : 下拨 Runtime
     DISPATCHED --> EXECUTING : Runtime 开始执行
-    EXECUTING --> PAUSED : 条件等待
-    PAUSED --> EXECUTING : 条件满足
+    EXECUTING --> PAUSED : 未 commit 且无可用 Runtime（挂起，12.2.1）
+    PAUSED --> EXECUTING : 巡检唤醒 resume（挂起无自动超时，D28）
     EXECUTING --> COMPLETED : 完成事件
-    EXECUTING --> INTERRUPTED : 失败/失联
-    PAUSED --> INTERRUPTED : 接管/超时
+    EXECUTING --> FAILED : 失败/失联（fail_reason 溯源，D28）
+    DISPATCHED --> CANCELLED : 用户取消·abort 下拨（D28）
+    EXECUTING --> CANCELLED : 用户取消·abort 下拨（D28）
+    PAUSED --> CANCELLED : 用户取消·挂起中（D28）
     TERMINATED --> [*]
     COMPLETED --> [*]
-    INTERRUPTED --> [*]
+    FAILED --> [*]
+    CANCELLED --> [*]
 ```
 
 ### 5.4 状态转换防护
@@ -725,7 +735,7 @@ stateDiagram-v2
 
 | 层面 | 幂等键 | 机制 |
 |---|---|---|
-| Admission | (session_id, turn_id, attempt_id) | UNIQUE + ON CONFLICT DO NOTHING（INBOX 吸收 OUTBOX 重复投递） |
+| Admission | (session_id, turn_id, attempt_id) | UNIQUE + ON CONFLICT DO NOTHING（同步回执幂等，决策 D15，吸收重复 submit） |
 | Committed | (invocation_id, seq) | UNIQUE + ON CONFLICT DO NOTHING |
 | 水位推进 | committed_seq 乐观锁 | 期望旧值匹配才更新 |
 | Lease 获取 | 写入前检查占用 | unique(lease_type,session_id) / unique(lease_type,invocation_id) |
@@ -803,11 +813,14 @@ classDiagram
         +runLoop() void
     }
     class TurnAdmissionService {
-        +admit(TurnReadyMessage) AdmissionResult
+        +admit(SubmitReceipt) AdmissionResult
     }
-    class OutboxConsumer {
-        +claim(int batchSize) List~TurnReadyMessage~
-        +ack(long outboxId) void
+    class SessionManagementClient {
+        +submit(...) SubmitReceipt
+        +retry(...) SubmitReceipt
+        +cancel(...) void
+        +commit(...) void
+        +update(...) void
     }
     class TurnQueueActivationService {
         +pollAndActivate() int
@@ -838,6 +851,23 @@ classDiagram
     class TurnRecoveryService {
         +recoverExpiredLeases() void
         +detectStalled() void
+        +recoverStuckActivating() void
+    }
+    class RecoveryCoordinator {
+        +mode() RecoveryMode
+        +runRecoveryCycle() void
+        +takeover(TakeoverContext) void
+    }
+    class PodHealthProbe {
+        +probe(String podId) ProbeResult
+        +candidates() List~String~
+    }
+    class InflightRegistry {
+        +register(InflightEntry) void
+        +unregister(String invocationId) void
+        +runningCount() int
+        +hasCapacity() boolean
+        +snapshot() Set~String~
     }
     class TurnStreamPushService {
         +pushDeltaToStream(DeltaEvent) void
@@ -851,7 +881,7 @@ classDiagram
     }
 
     SchedulingLoop --> TurnAdmissionService
-    TurnAdmissionService --> OutboxConsumer
+    TurnAdmissionService --> SessionManagementClient
     SchedulingLoop --> TurnQueueActivationService
     SchedulingLoop --> TurnExecutionService
     SchedulingLoop --> LeaseHeartbeatService
@@ -861,6 +891,9 @@ classDiagram
     RuntimeEventRouter --> TurnCompletionService
     TurnConfirmService --> TurnStreamPushService
     TurnRecoveryService --> TurnExecutionService
+    TurnRecoveryService --> RecoveryCoordinator
+    RecoveryCoordinator --> PodHealthProbe
+    SchedulingLoop --> InflightRegistry
     TurnExecutionService --> ShardRouter
 ```
 
@@ -868,9 +901,8 @@ classDiagram
 
 ```java
 public interface TurnSchedulerPorts {
-    // 准入（M1）+ Outbox 消费
-    AdmissionResult admit(TurnReadyMessage msg);
-    List<TurnReadyMessage> claimOutbox(int batchSize);
+    // 准入（M1）+ 同步回执落账（决策 D1/D15）
+    AdmissionResult admit(SubmitReceipt receipt);
 
     // 激活（M2）
     int pollAndActivate();
@@ -893,6 +925,30 @@ public interface TurnSchedulerPorts {
     // 恢复（M9）
     int recoverExpired();     // 返回接管数
     int detectStalled();      // 返回中断数
+```
+
+**恢复与容量相关接口（决策 7/10）：**
+
+```java
+public interface RecoveryCoordinator {
+    RecoveryMode mode();                         // leaderless（默认，v1）| leader（预留，v2）
+    void onHealthProbeResult(PodHealthProbe.Result r); // 观测结论：日志 + 指标（判死≠接管）
+    void runRecoveryCycle();                     // 过期租约回收 + 卡死判定（判据 1/2/3）
+    void takeover(TakeoverContext ctx);          // PG 租约 + epoch 递增 + 新 fencing token
+}
+
+public interface PodHealthProbe {
+    Result probe(String podId);                  // GET /internal/health，2s 超时，30s 节流
+    List<String> candidates();                   // Nacos 心跳超时的候选 Pod
+}
+
+public class InflightRegistry {                  // Pod 本地内存注册表（非权威）
+    void register(InflightEntry e);
+    void unregister(String invocationId);
+    int  runningCount();                          // 未过期 controller lease 条目数
+    boolean hasCapacity();                        // runningCount() < max_running
+    Set<String> snapshot();                       // Nacos 观测上报（纯观测）
+}
 
     // 推送（M10）
     void pushDelta(DeltaEvent evt);
@@ -917,10 +973,10 @@ public interface TurnSchedulerPorts {
 
 | 操作 | 重试次数 | 退避 | 上限时长 |
 |---|---|---|---|
-| Outbox 消费 | 无限（幂等） | 200ms 平滑 | - |
+| 同步 submit 回执落账 | 无限（幂等） | 幂等键吸收重放 | - |
 | 激活竞争 | 无限（循环） | 下一轮 | - |
 | Spec 冻结 | 3 | 指数 100ms/1s/10s | 30s 内 |
-| Runtime 下拨 | 2 | 1s/5s | 换实例重试 |
+| Runtime 下拨/重派 | 5 | 1s/2s/4s/8s/16s | 换实例重派；超限 Attempt 中断（决策 6，fail_reason='RETRY_EXCEEDED'） |
 
 ### 8.3 死信处理
 
@@ -950,7 +1006,7 @@ public interface TurnSchedulerPorts {
 | 并发 | 100 Producer × 25 Pod × 745 Session 竞争激活；SKIP LOCKED 无死锁 |
 | 故障 | Pod 宕机接管、Runtime 失联中断、lease 过期兜底、双活不可能性 |
 | 流式 | attempt 切换 stream_reset、断线续读水位、旧 attempt 事件不串流 |
-| 集成 | Gateway Outbox → 调度 → Runtime → 确认 → 完成全链路 |
+| 集成 | Gateway submit（同步）→ 调度 → Runtime → 确认 → 完成全链路 |
 | 压测 | 稳态 50 turns/s、峰值 150、Redis 积压、PG 连接水位 |
 | 分片 | N=1/2 切换路由一致性、session 同 shard 约束 |
 
@@ -967,6 +1023,11 @@ public interface TurnSchedulerPorts {
 | ts_lock_contention_rate | Gauge | queue / invocation |
 | ts_lease_duration_seconds | Histogram | lease=session/controller |
 | ts_takeover_total | Counter | reason={l0,l1,l2} |
+| ts_takeover_attempt_total | Counter | source_pod / outcome={ok,conflict,denied} |
+| ts_takeover_conflict_total | Counter | epoch CAS 失败次数 |
+| ts_pod_health_event_total | Counter | outcome={confirmed,alive} |
+| ts_inflight_running | Gauge | 本 Pod InflightRegistry 运行数 |
+| ts_inflight_gate_hit_total | Counter | 容量门控命中（running_count >= max_running） |
 | ts_queue_depth | Gauge | status=waiting |
 | ts_delta_latency_ms | Histogram | p50/p95/p99 |
 | ts_stream_backlog | Gauge | session 维度聚合 |
@@ -977,7 +1038,7 @@ public interface TurnSchedulerPorts {
 |---|---|---|
 | 接管风暴 | rate(ts_takeover_total[5m]) > 10 | P1 |
 | 锁竞争异常 | ts_lock_contention_rate > 0.5 持续 5m | P2 |
-| 中断率过高 | rate(interrupted)/rate(completed) > 0.1 | P1 |
+| 失败率过高 | rate(failed)/rate(completed) > 0.1 | P1 |
 | 队列积压 | ts_queue_depth > 1000 | P2 |
 | Delta 延迟 | p95 > 500ms | P2 |
 

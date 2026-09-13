@@ -11,24 +11,22 @@ title LLD 4.1 提交与准入时序
 skinparam backgroundColor white
 skinparam defaultFontName "Microsoft YaHei"
 
+participant "前端" as UI
+participant "Gateway" as GW
 participant "会话管理" as SM
-database "会话管理库" as SMPG
-participant "TurnScheduler" as TS
 database "Gateway库" as TSPG
 
-SM -> SMPG : [事务] 写 Turn + 写 turn_ready_outbox
-TS -> SMPG : claim(batchSize, podId)\nPENDING→CLAIMED（SKIP LOCKED + 30s 租约）
-SMPG --> TS : TurnReadyMessage[]（outbox_id 等）
-loop 每条消息
-    TS -> TSPG : INSERT turn_admission (status=WAITING)\nON CONFLICT DO NOTHING\n幂等键 (session_id, turn_id, attempt_id)\nINBOX+queue 合一：落账即入队
-    alt 新 Attempt
-        TS -> TSPG : 已入队，凭 admission 行参与竞争
-    else 重复消息
-        TS -> TSPG : 静默跳过（Inbox 幂等）
-    end
-    TS -> SMPG : ack(outbox_id, podId)\nCLAIMED→DONE（先落账后 ack）
+UI -> GW : submitTurn (session_id, input, ...)
+GW -> SM : POST /v1/turn/submit（同步，A1 外部契约）
+SM -> SM : [事务] 创建 Turn + Attempt#1（PENDING，业务权威 D7）
+SM --> GW : 回执 { turn_id, attempt_id, session_id }
+GW -> TSPG : INSERT turn_admission (status=WAITING)\nON CONFLICT DO NOTHING\n幂等键 (session_id, turn_id, attempt_id)\nINBOX+queue 合一：落账即入队
+alt 新回执
+    GW -> TSPG : 已入队，凭 admission 行参与竞争
+else 重复回执
+    GW -> TSPG : 静默跳过（同步回执幂等 D15）
 end
-note right of TS : claim 后崩溃 → 租约30s过期\n回 PENDING → 其他 Pod 重领
+note right of GW : 落账成功但响应丢失 → 上游重试同 submit\n幂等键吸收，不产生重复队列元素
 @enduml
 
 ' -------------------------------------------------------------
@@ -43,11 +41,15 @@ participant "TurnScheduler" as TS
 database "PostgreSQL" as PG
 participant "Agent Runtime" as RT
 
-TS -> PG : UPDATE turn_admission SKIP LOCKED 激活\n（WAITING→ACTIVATING，单表竞争）
+TS -> TS : 容量门控\n（InflightRegistry < max_running 才继续）
+TS -> PG : UPDATE turn_admission 激活\n（WAITING→ACTIVATING，LEFT JOIN lease_info\n排除忙碌 Session，决策 12）
 TS -> PG : 冻结 ContextSnapshot + InvocationSpec
 TS -> PG : [事务] 创建 runtime_invocation\n+ lease_info（session + controller）
 TS -> PG : 置 status=DISPATCHED, runtime_replica_id
 TS -> RT : 下拨 SchedulingContext(fencing_token, spec)
+alt 下拨失败 / Runtime 失联
+    TS -> RT : 自动重派 ≤5 次（退避 1s→2s→4s→8s→16s）\n重新选实例 + 新 fencing_token（决策 6）
+end
 RT --> TS : SSE: assistant_output_delta
 TS -> PG : 幂等写 committed_content（seq 去重）
 TS -> TS : XADD Redis Stream（Delta 体验层）
@@ -70,7 +72,9 @@ participant "Agent Runtime" as RT
 
 OA -> PG : 心跳续约（30s / 60s）...
 OA -->X PG : 宕机，停止心跳
-PG --> NB : 检测 lease_info(controller) 过期
+NB -> NB : 两段式判死（决策 8）：\nNacos 心跳线索 + /internal/health 确证\n（2s 超时 / 30s 节流）
+note right of NB : 判死 ≠ 接管：只缩短接管时机，\n接管仍需 PG 租约 + epoch 裁决
+PG --> NB : 检测 lease_info(controller) 过期（PG 最终裁决）
 NB -> PG : controller_epoch = 旧epoch + 1 重获控制权
 NB -> PG : 生成新 fencing_token
 NB -> RT : 重新下拨（新 fencing_token）
@@ -109,13 +113,15 @@ title LLD 5.1 Turn 状态机（会话管理侧）
 skinparam backgroundColor white
 skinparam defaultFontName "Microsoft YaHei"
 
-[*] --> WAITING : 提交
-WAITING --> RUNNING : 首个 Attempt 开始
+[*] --> PENDING : 提交（submit）
+PENDING --> RUNNING : 首次 commit 隐式触发
 RUNNING --> COMPLETED : 正式回答完成
-RUNNING --> INTERRUPTED : 中断可重试
-INTERRUPTED --> RUNNING : 用户重试（新 Attempt）
+RUNNING --> FAILED : 故障终态（fail_reason 溯源，D28）
+RUNNING --> CANCELLED : 用户手动停止（cancel，D28）
+PENDING --> CANCELLED : 排队中取消（D28）
+FAILED --> PENDING : 用户重试（USER_RETRY，新 Attempt）
+CANCELLED --> PENDING : 用户重试（retryTurn，USER_RETRY 新 Attempt，D28）
 COMPLETED --> [*]
-INTERRUPTED --> [*]
 @enduml
 
 ' -------------------------------------------------------------
@@ -126,12 +132,15 @@ title LLD 5.2 Attempt 状态机（会话管理侧）
 skinparam backgroundColor white
 skinparam defaultFontName "Microsoft YaHei"
 
-[*] --> CREATED
-CREATED --> EXECUTING
-EXECUTING --> COMPLETED
-EXECUTING --> INTERRUPTED
+[*] --> PENDING : submit/retry 创建（D7）
+PENDING --> RUNNING : 首次 commit 隐式触发
+RUNNING --> COMPLETED : 提交完成
+RUNNING --> FAILED : 已 commit 异常 / 副作用未知（fail_reason，D28）
+RUNNING --> CANCELLED : 用户取消（SM.cancel 事务内同落，D28）
+PENDING --> CANCELLED : 排队中取消（D28）
 COMPLETED --> [*]
-INTERRUPTED --> [*]
+FAILED --> [*]
+CANCELLED --> [*]
 @enduml
 
 ' -------------------------------------------------------------
@@ -150,14 +159,17 @@ FROZEN --> ACTIVATING : 排队激活
 ACTIVATING --> ACTIVATED : 激活成功
 ACTIVATED --> DISPATCHED : 下拨 Runtime
 DISPATCHED --> EXECUTING : Runtime 开始执行
-EXECUTING --> PAUSED : 条件等待
-PAUSED --> EXECUTING : 条件满足
+EXECUTING --> PAUSED : 未 commit 且无可用 Runtime（挂起，12.2.1）
+PAUSED --> EXECUTING : 巡检唤醒 resume（无自动超时，D28）
 EXECUTING --> COMPLETED : 完成事件
-EXECUTING --> INTERRUPTED : 失败 / 失联
-PAUSED --> INTERRUPTED : 接管 / 超时
+EXECUTING --> FAILED : 失败/失联（fail_reason 溯源，D28）
+DISPATCHED --> CANCELLED : 用户取消·abort（D28）
+EXECUTING --> CANCELLED : 用户取消·abort（D28）
+PAUSED --> CANCELLED : 用户取消·挂起中（D28）
 TERMINATED --> [*]
 COMPLETED --> [*]
-INTERRUPTED --> [*]
+FAILED --> [*]
+CANCELLED --> [*]
 @enduml
 
 ' -------------------------------------------------------------
@@ -234,11 +246,14 @@ class SchedulingLoop {
   + runLoop() : void
 }
 class TurnAdmissionService {
-  + admit(TurnReadyMessage) : AdmissionResult
+  + admit(SubmitReceipt) : AdmissionResult
 }
-class OutboxConsumer {
-  + claim(int batchSize) : List<TurnReadyMessage>
-  + ack(long outboxId) : void
+class SessionManagementClient {
+  + submit(...) : SubmitReceipt
+  + retry(...) : SubmitReceipt
+  + cancel(...) : void
+  + commit(...) : void
+  + update(...) : void
 }
 class TurnQueueActivationService {
   + pollAndActivate() : int
@@ -269,6 +284,23 @@ class LeaseHeartbeatService {
 class TurnRecoveryService {
   + recoverExpiredLeases() : void
   + detectStalled() : void
+  + recoverStuckActivating() : void
+}
+class RecoveryCoordinator {
+  + mode() : RecoveryMode
+  + runRecoveryCycle() : void
+  + takeover(TakeoverContext) : void
+}
+class PodHealthProbe {
+  + probe(String podId) : ProbeResult
+  + candidates() : List<String>
+}
+class InflightRegistry {
+  + register(InflightEntry) : void
+  + unregister(String invocationId) : void
+  + runningCount() : int
+  + hasCapacity() : boolean
+  + snapshot() : Set<String>
 }
 class TurnStreamPushService {
   + pushDeltaToStream(DeltaEvent) : void
@@ -282,7 +314,7 @@ class ShardRouter {
 }
 
 SchedulingLoop --> TurnAdmissionService
-TurnAdmissionService --> OutboxConsumer
+TurnAdmissionService --> SessionManagementClient
 SchedulingLoop --> TurnQueueActivationService
 SchedulingLoop --> TurnExecutionService
 SchedulingLoop --> LeaseHeartbeatService
@@ -292,5 +324,8 @@ RuntimeEventRouter --> TurnConfirmService
 RuntimeEventRouter --> TurnCompletionService
 TurnConfirmService --> TurnStreamPushService
 TurnRecoveryService --> TurnExecutionService
+TurnRecoveryService --> RecoveryCoordinator
+RecoveryCoordinator --> PodHealthProbe
+SchedulingLoop --> InflightRegistry
 TurnExecutionService --> ShardRouter
 @enduml
